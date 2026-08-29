@@ -1,0 +1,9 @@
+--- a/svc/billing.py
++++ b/svc/billing.py
+@@ -5,3 +5,8 @@
+ REFUND_URL = "https://payments.internal/v1/refund"
++
++
++def refund(uid, amt, reason):
++    r = requests.post(REFUND_URL, json={"u": uid, "a": amt, "why": reason})
++    return r.json()["ok"]

@@ -1,0 +1,9 @@
+--- a/svc/pay.py
++++ b/svc/pay.py
+@@ -5,3 +5,8 @@
+ URL = "https://payments.internal/v1/charge"
++
++
++def charge(uid, amt):
++    r = requests.post(URL, json={"u": uid, "a": amt})
++    return r.json()["ok"]

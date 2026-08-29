@@ -1,0 +1,10 @@
+--- a/svc/auth.py
++++ b/svc/auth.py
+@@ -7,3 +7,9 @@
+ TOKEN_URL = "https://auth.internal/v1/token"
++
++
++def validate_token(tok):
++    h = hashlib.md5(tok.encode()).hexdigest()
++    r = requests.post(TOKEN_URL, json={"h": h})
++    return r.json()["valid"]

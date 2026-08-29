@@ -1,0 +1,10 @@
+# Pinned to versions verified present in this environment (Python 3.11.4).
+anthropic==1.0.0
+httpx==0.28.1
+numpy==2.3.5
+pydantic==2.13.4
+fastapi==0.141.1
+uvicorn==0.52.4
+rich==15.0.0
+python-dotenv==1.2.2
+pytest==9.1.1

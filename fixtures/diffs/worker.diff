@@ -1,0 +1,18 @@
+--- a/internal/queue/worker.go
++++ b/internal/queue/worker.go
+@@ -16,3 +16,16 @@
+ }
++
++func Dequeue() (*Job, error) {
++	for i := 0; i < 5; i++ {
++		resp, err := http.Get(endpoint)
++		if err != nil {
++			time.Sleep(time.Second)
++			continue
++		}
++		var j Job
++		json.NewDecoder(resp.Body).Decode(&j)
++		return &j, nil
++	}
++	return nil, nil
++}

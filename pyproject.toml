@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "feedback-memory-review-agent"
+version = "1.0.0"
+description = "Code review agent with feedback-memory: learns team conventions from reviewer actions"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+authors = [{name = "Team"}]
+keywords = ["code-review", "llm", "agent", "memory", "anthropic"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+]
+
+dependencies = [
+    "anthropic==1.0.0",
+    "httpx==0.28.1",
+    "numpy==2.3.5",
+    "pydantic==2.13.4",
+    "fastapi==0.141.1",
+    "uvicorn==0.52.4",
+    "rich==15.0.0",
+    "python-dotenv==1.2.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[project.scripts]
+review = "app.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*", "eval*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+ignore = ["E501"]
