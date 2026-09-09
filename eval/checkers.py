@@ -164,7 +164,10 @@ def _check_require_field(rule: dict, findings: list[dict]) -> Verdict:
             n_relevant=0,
         )
     missing = []
+    relevant = []
     for f in findings:
+        if not isinstance(f, dict):
+            continue
         v = f.get(field)
         if field == "line":
             ok = isinstance(v, int) and v > 0
@@ -172,22 +175,23 @@ def _check_require_field(rule: dict, findings: list[dict]) -> Verdict:
             ok = bool(v and str(v).strip())
         if not ok:
             missing.append(f)
+        relevant.append(f)
     if missing:
         return Verdict(
             rule.get("id"),
             rule["rule_text"],
             rule["assert_kind"],
             FAIL,
-            f"{len(missing)}/{len(findings)} finding(s) missing {field!r}",
-            n_relevant=len(findings),
+            f"{len(missing)}/{len(relevant)} finding(s) missing {field!r}",
+            n_relevant=len(relevant),
         )
     return Verdict(
         rule.get("id"),
         rule["rule_text"],
         rule["assert_kind"],
         PASS,
-        f"all {len(findings)} finding(s) populate {field!r}",
-        n_relevant=len(findings),
+        f"all {len(relevant)} finding(s) populate {field!r}",
+        n_relevant=len(relevant),
     )
 
 

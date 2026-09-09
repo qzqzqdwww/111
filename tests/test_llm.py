@@ -211,3 +211,118 @@ class TestShared:
             assert a is b
         finally:
             llm_mod._shared = old
+
+
+# --- TestLLMConnectionRetry -------------------------------------------------
+
+
+class TestLLMConnectionRetry:
+    def test_retries_on_connection_error(self):
+        llm = _make_llm()
+        llm.max_retries = 3
+
+        mock_request = MagicMock()
+        fail = anthropic.APIConnectionError(message="network down", request=mock_request)
+        ok = _usage_resp()
+        llm._client.messages.create.side_effect = [fail, ok]
+
+        usage = Usage()
+        r = llm.call(model="m", messages=[], max_tokens=10, usage=usage)
+        assert r is ok
+        assert llm._client.messages.create.call_count == 2
+
+    def test_exhausts_retries_then_raises(self):
+        llm = _make_llm()
+        llm.max_retries = 2
+
+        llm._client.messages.create.side_effect = anthropic.APIStatusError(
+            message="still down", response=MagicMock(status_code=503), body={},
+        )
+
+        with pytest.raises(LLMError, match="exhausted"):
+            llm.call(model="m", messages=[], max_tokens=10)
+
+        assert llm._client.messages.create.call_count == 2
+
+    def test_429_retried(self):
+        llm = _make_llm()
+        llm.max_retries = 3
+
+        fail = anthropic.APIStatusError(
+            message="rate limited", response=MagicMock(status_code=429), body={},
+        )
+        ok = _usage_resp()
+        llm._client.messages.create.side_effect = [fail, ok]
+
+        usage = Usage()
+        r = llm.call(model="m", messages=[], max_tokens=10, usage=usage)
+        assert r is ok
+        assert llm._client.messages.create.call_count == 2
+
+    def test_529_retried(self):
+        llm = _make_llm()
+        llm.max_retries = 2
+
+        fail = anthropic.APIStatusError(
+            message="overloaded", response=MagicMock(status_code=529), body={},
+        )
+        ok = _usage_resp()
+        llm._client.messages.create.side_effect = [fail, ok]
+
+        usage = Usage()
+        r = llm.call(model="m", messages=[], max_tokens=10, usage=usage)
+        assert r is ok
+
+
+# --- TestUsageCostCalculation ----------------------------------------------
+
+
+class TestUsageCostCalculation:
+    def test_sonnet_cost(self):
+        """Verify the cost formula against known prices."""
+        u = Usage()
+        resp = MagicMock()
+        resp.usage = MagicMock(
+            input_tokens=1_000_000,
+            output_tokens=500_000,
+            cache_creation_input_tokens=100_000,
+            cache_read_input_tokens=900_000,
+        )
+        u.add_response(config.MODEL_MAIN, resp)
+        # Sonnet: $3/M inp, $15/M out, cache_write 1.25x, cache_read 0.1x
+        expected = (
+            1_000_000 * 3.00
+            + 500_000 * 15.00
+            + 100_000 * 3.00 * 1.25
+            + 900_000 * 3.00 * 0.10
+        ) / 1_000_000
+        assert u.cost_usd == pytest.approx(expected)
+
+    def test_zero_tokens_zero_cost(self):
+        u = Usage()
+        assert u.cost_usd == 0.0
+
+    def test_merge_preserves_all_fields(self):
+        a = Usage(in_tok=1, out_tok=2, cache_write=3, cache_read=4,
+                  embed_tok=5, cost_usd=0.1, calls=2)
+        b = Usage(in_tok=10, out_tok=20, cache_write=30, cache_read=40,
+                  embed_tok=50, cost_usd=0.2, calls=3)
+        a.merge(b)
+        assert a.in_tok == 11
+        assert a.out_tok == 22
+        assert a.cache_write == 33
+        assert a.cache_read == 44
+        assert a.embed_tok == 55
+        assert a.cost_usd == pytest.approx(0.3)
+        assert a.calls == 5
+
+    def test_cache_hit_ratio_formula(self):
+        """cache_read / (cache_read + cache_write + in_tok)"""
+        u = Usage(cache_read=70, cache_write=20, in_tok=10)
+        expected = 70 / (70 + 20 + 10)
+        assert u.cache_hit_ratio == pytest.approx(expected)
+
+    def test_as_dict_rounds_cost(self):
+        u = Usage(cost_usd=0.123456789)
+        d = u.as_dict()
+        assert d["cost_usd"] == 0.123457  # rounded to 6 places

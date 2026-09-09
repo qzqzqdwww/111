@@ -196,3 +196,110 @@ class TestPreflight:
         assert "models" in res
         assert "main" in res["models"]
         assert "cheap" in res["models"]
+
+
+# --- TestReviewTaskMemoryOn ------------------------------------------------
+
+
+class TestReviewTaskMemoryOn:
+    def test_rules_injected_from_store(self, fake_embed):
+        conn = memory.connect(":memory:")
+        llm = _mock_llm()
+        try:
+            # Seed a rule into the store
+            rid, _ = memory.add_rule(
+                conn,
+                memory.Rule(
+                    rule_text="Include evidence in findings",
+                    scope="global",
+                    is_meta=True,
+                    assert_kind="require_field",
+                    assert_field="evidence",
+                    evidence_count=3,
+                    confidence=0.9,
+                ),
+            )
+            res = pipeline.review_task(conn, "pay", memory_on=True, llm=llm)
+            assert res["memory_on"] is True
+            # The seeded rule should appear in injected_rules
+            injected_texts = [r["rule_text"] for r in res["injected_rules"]]
+            assert "Include evidence in findings" in injected_texts
+        finally:
+            conn.close()
+
+    def test_cost_breakdown(self, fake_embed):
+        conn = memory.connect(":memory:")
+        llm = _mock_llm()
+        try:
+            res = pipeline.review_task(conn, "pay", memory_on=True, llm=llm)
+            cost = res["cost"]
+            assert "memory_usd" in cost
+            assert "generation_usd" in cost
+            assert "total_usd" in cost
+            # total = memory + generation (approximately)
+            assert cost["total_usd"] == pytest.approx(
+                cost["memory_usd"] + cost["generation_usd"], abs=0.001
+            )
+        finally:
+            conn.close()
+
+    def test_timing_breakdown(self, fake_embed):
+        conn = memory.connect(":memory:")
+        llm = _mock_llm()
+        try:
+            res = pipeline.review_task(conn, "pay", memory_on=True, llm=llm)
+            t = res["timing"]
+            assert "retrieval" in t
+            assert "generation" in t
+            assert "user_visible" in t
+            # user_visible = retrieval + generation when memory is on
+            assert t["user_visible"] == pytest.approx(
+                t["retrieval"] + t["generation"]
+            )
+        finally:
+            conn.close()
+
+    def test_usage_accumulated(self, fake_embed):
+        conn = memory.connect(":memory:")
+        llm = _mock_llm()
+        try:
+            res = pipeline.review_task(conn, "pay", memory_on=True, llm=llm)
+            u = res["usage"]
+            assert "in_tok" in u
+            assert "out_tok" in u
+            assert "cache_read" in u
+            assert "cache_write" in u
+            assert "cache_hit_ratio" in u
+        finally:
+            conn.close()
+
+    def test_no_rules_means_empty_injection(self, fake_embed):
+        conn = memory.connect(":memory:")
+        llm = _mock_llm()
+        try:
+            # No rules seeded, memory ON
+            res = pipeline.review_task(conn, "pay", memory_on=True, llm=llm)
+            assert res["injected_rules"] == []
+        finally:
+            conn.close()
+
+
+# --- TestApplyFeedbackEdgeCases --------------------------------------------
+
+
+class TestApplyFeedbackEdgeCases:
+    def test_no_actions_returns_empty(self):
+        conn = memory.connect(":memory:")
+        llm = _mock_llm()
+        try:
+            findings = [{"file": "x.py", "line": 1, "category": "security",
+                          "severity": "high", "message": "m", "evidence": "e"}]
+            # payload with only "keep" actions -> no deletions/edits
+            payload = [{"index": 0, "action": "keep"}]
+            res = pipeline.apply_feedback(
+                conn, "pay", findings=findings, payload=payload, llm=llm,
+            )
+            assert res["rules"] == []
+            assert res["cost"]["memory_usd"] == 0.0
+        finally:
+            conn.close()

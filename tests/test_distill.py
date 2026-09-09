@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import sqlite3
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -10,10 +10,13 @@ from app import schemas
 from app.config import SINGLE_EVIDENCE_CAP
 from app.distill import (
     FeedbackAction,
+    DistillResult,
     _coerce_rule,
     _render_feedback,
     actions_from_payload,
+    distill,
 )
+from app.llm import Usage
 from app.memory import Rule
 
 
@@ -147,3 +150,196 @@ class TestCoerceRule:
         )
         assert rule is not None
         assert rule.assert_kind == "none"
+
+
+# --- helpers for integration tests ------------------------------------------
+
+
+def _mock_llm_for_distill(rules_payload):
+    m = MagicMock()
+    def _structured(**kw):
+        usage = kw.get("usage")
+        if usage is not None:
+            usage.calls += 1
+        return {"rules": rules_payload}
+    m.structured = MagicMock(side_effect=_structured)
+    return m
+
+
+# --- TestDistillResult -----------------------------------------------------
+
+
+class TestDistillResult:
+    def test_empty_as_dict(self):
+        dr = DistillResult()
+        d = dr.as_dict()
+        assert d["rules"] == []
+        assert d["feedback_id"] is None
+        assert d["t_distill"] == 0.0
+        assert d["actions"] == {}
+
+    def test_as_dict_with_values(self):
+        usage = Usage(in_tok=10, cost_usd=0.01)
+        dr = DistillResult(
+            rules=[{"rule_text": "r", "scope": "global", "id": 1, "action": "inserted"}],
+            feedback_id=5,
+            usage=usage,
+            t_distill=0.3,
+            actions={"keep": 1, "delete": 2, "edit": 0},
+        )
+        d = dr.as_dict()
+        assert len(d["rules"]) == 1
+        assert d["feedback_id"] == 5
+        assert d["t_distill"] == 0.3
+        assert d["usage"]["in_tok"] == 10
+
+
+# --- TestDistill -----------------------------------------------------------
+
+
+class TestDistill:
+    def test_empty_actions_returns_early(self, conn, fake_embed):
+        llm = _mock_llm_for_distill([])
+        usage = Usage()
+        result = distill(
+            conn, task_id="pay", actions=[], language="python",
+            area="svc/pay.py", llm=llm, usage=usage,
+        )
+        assert result.rules == []
+        assert result.feedback_id is None
+        assert usage.calls == 0
+
+    def test_returns_rules_from_llm(self, conn, fake_embed):
+        rules_payload = [{
+            "rule_text": "No style nits",
+            "scope": "global",
+            "is_meta": True,
+            "assertion": {"kind": "forbid_category", "category": "style",
+                          "severity": "", "field": ""},
+            "evidence_count": 1,
+            "confidence": 0.5,
+            "tags": ["style"],
+        }]
+        llm = _mock_llm_for_distill(rules_payload)
+        usage = Usage()
+        actions = [
+            FeedbackAction("delete", {"category": "style", "severity": "low"},
+                           note="no nits"),
+        ]
+        result = distill(
+            conn, task_id="pay", actions=actions, language="python",
+            area="svc/pay.py", llm=llm, usage=usage,
+        )
+        assert len(result.rules) == 1
+        assert result.rules[0]["rule_text"] == "No style nits"
+        assert result.rules[0]["scope"] == "global"
+        assert result.feedback_id is not None
+        assert usage.calls == 1
+
+    def test_records_feedback_event(self, conn, fake_embed):
+        llm = _mock_llm_for_distill([{
+            "rule_text": "Rule", "scope": "global", "is_meta": False,
+            "assertion": {"kind": "none", "category": "", "severity": "", "field": ""},
+            "evidence_count": 1, "confidence": 0.5, "tags": [],
+        }])
+        actions = [FeedbackAction("keep", {"category": "x", "severity": "y", "message": "m"})]
+        result = distill(
+            conn, task_id="pay", actions=actions, language="python",
+            area="svc/pay.py", llm=llm,
+        )
+        assert result.feedback_id is not None
+        assert result.feedback_id > 0
+        row = conn.execute(
+            "SELECT * FROM feedback_events WHERE id=?", (result.feedback_id,)
+        ).fetchone()
+        assert row is not None
+        assert row["task_id"] == "pay"
+
+    def test_dedup_same_rule_text(self, conn, fake_embed):
+        rules_payload = [
+            {"rule_text": "Same rule", "scope": "global", "is_meta": False,
+             "assertion": {"kind": "none", "category": "", "severity": "", "field": ""},
+             "evidence_count": 1, "confidence": 0.5, "tags": []},
+            {"rule_text": "Same rule", "scope": "global", "is_meta": False,
+             "assertion": {"kind": "none", "category": "", "severity": "", "field": ""},
+             "evidence_count": 1, "confidence": 0.5, "tags": []},
+        ]
+        llm = _mock_llm_for_distill(rules_payload)
+        actions = [
+            FeedbackAction("delete", {"category": "x", "severity": "y", "message": "m"}),
+            FeedbackAction("delete", {"category": "x", "severity": "y", "message": "m2"}),
+        ]
+        result = distill(
+            conn, task_id="pay", actions=actions, language="python",
+            area="svc/pay.py", llm=llm,
+        )
+        texts = [r["rule_text"] for r in result.rules]
+        assert texts.count("Same rule") == 1
+
+    def test_drops_malformed_rules(self, conn, fake_embed):
+        rules_payload = [
+            {"rule_text": "", "scope": "global", "is_meta": False,
+             "assertion": {"kind": "none", "category": "", "severity": "", "field": ""},
+             "evidence_count": 1, "confidence": 0.5, "tags": []},
+            {"rule_text": "   ", "scope": "global", "is_meta": False,
+             "assertion": {"kind": "none", "category": "", "severity": "", "field": ""},
+             "evidence_count": 1, "confidence": 0.5, "tags": []},
+            {"rule_text": "Good rule", "scope": "global", "is_meta": False,
+             "assertion": {"kind": "none", "category": "", "severity": "", "field": ""},
+             "evidence_count": 1, "confidence": 0.5, "tags": []},
+        ]
+        llm = _mock_llm_for_distill(rules_payload)
+        actions = [
+            FeedbackAction("delete", {"category": "x", "severity": "y", "message": "m"}),
+        ]
+        result = distill(
+            conn, task_id="pay", actions=actions, language="python",
+            area="svc/pay.py", llm=llm,
+        )
+        assert len(result.rules) == 1
+        assert result.rules[0]["rule_text"] == "Good rule"
+
+    def test_max_rules_cap(self, conn, fake_embed):
+        rules_payload = [
+            {"rule_text": f"Rule {i}", "scope": "global", "is_meta": False,
+             "assertion": {"kind": "none", "category": "", "severity": "", "field": ""},
+             "evidence_count": 1, "confidence": 0.5, "tags": []}
+            for i in range(10)
+        ]
+        llm = _mock_llm_for_distill(rules_payload)
+        actions = [
+            FeedbackAction("delete", {"category": "x", "severity": "y", "message": "m"})
+            for _ in range(10)
+        ]
+        result = distill(
+            conn, task_id="pay", actions=actions, language="python",
+            area="svc/pay.py", llm=llm,
+        )
+        assert len(result.rules) <= 3
+
+    def test_actions_counted(self, conn, fake_embed):
+        llm = _mock_llm_for_distill([])
+        actions = [
+            FeedbackAction("keep", {}),
+            FeedbackAction("delete", {}),
+            FeedbackAction("delete", {}),
+            FeedbackAction("edit", {}, replacement={}),
+        ]
+        result = distill(
+            conn, task_id="pay", actions=actions, language="python",
+            area="svc/pay.py", llm=llm,
+        )
+        assert result.actions == {"keep": 1, "delete": 2, "edit": 1}
+
+    def test_persist_false_skips_feedback_record(self, conn, fake_embed):
+        llm = _mock_llm_for_distill([{
+            "rule_text": "Rule", "scope": "global", "is_meta": False,
+            "assertion": {"kind": "none", "category": "", "severity": "", "field": ""},
+            "evidence_count": 1, "confidence": 0.5, "tags": [],
+        }])
+        actions = [FeedbackAction("keep", {})]
+        result = distill(
+            conn, task_id="pay", actions=actions, language="python",
+            area="svc/pay.py", llm=llm, persist=False,
+        )
+        assert result.feedback_id is None

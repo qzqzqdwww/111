@@ -29,3 +29,38 @@ class TestCatalog:
         assert task_id in qt or t.path in qt
         assert t.lang in qt
         assert t.change_kind in qt
+
+    def test_all_tasks_have_required_fields(self):
+        for task_id in catalog.ids():
+            t = catalog.get(task_id)
+            assert t.task_id
+            assert t.path
+            assert t.lang
+            assert t.change_kind
+            assert t.query_text
+            assert t.area
+
+    def test_pay_path(self):
+        t = catalog.get("pay")
+        assert "pay" in t.path
+
+    def test_auth_path(self):
+        t = catalog.get("auth")
+        assert "auth" in t.path
+
+    def test_billing_path(self):
+        t = catalog.get("billing")
+        assert "billing" in t.path
+
+    def test_worker_go_lang(self):
+        t = catalog.get("worker")
+        assert t.lang == "go"
+
+    def test_worker_has_query_text(self):
+        t = catalog.get("worker")
+        assert "go" in t.query_text or "worker" in t.query_text
+
+    def test_task_area_matches_path(self):
+        for task_id in catalog.ids():
+            t = catalog.get(task_id)
+            assert t.area in t.path or t.path in t.area

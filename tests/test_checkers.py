@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+import json
+import math
+from unittest.mock import MagicMock
+
 import pytest
 
 from eval import checkers
+
+
+# --- checker functions ------------------------------------------------------
 
 
 class TestForbidCategory:
@@ -31,6 +38,21 @@ class TestForbidCategory:
         assert verdict.outcome == checkers.PASS
         assert verdict.n_relevant == 0
 
+    def test_multiple_findings_counts_all(self):
+        verdict = checkers._check_forbid_category(
+            {"id": 1, "rule_text": "no style", "assert_kind": "forbid_category", "assert_cat": "style"},
+            [{"category": "style"}, {"category": "style"}, {"category": "security"}],
+        )
+        assert verdict.outcome == checkers.FAIL
+        assert verdict.n_relevant == 2
+
+    def test_empty_rule_text_still_works(self):
+        verdict = checkers._check_forbid_category(
+            {"id": 1, "rule_text": "", "assert_kind": "forbid_category", "assert_cat": "security"},
+            [{"category": "security"}],
+        )
+        assert verdict.outcome == checkers.FAIL
+
 
 class TestRequireSeverity:
     def test_pass_when_all_high(self):
@@ -53,6 +75,14 @@ class TestRequireSeverity:
             [{"category": "security", "severity": "high"}],
         )
         assert verdict.outcome == checkers.VACUOUS
+
+    def test_mixed_severity_fails(self):
+        verdict = checkers._check_require_severity(
+            {"id": 1, "rule_text": "high val", "assert_kind": "require_severity_for_category", "assert_cat": "security", "assert_sev": "high"},
+            [{"category": "security", "severity": "high"}, {"category": "security", "severity": "low"}],
+        )
+        assert verdict.outcome == checkers.FAIL
+        assert verdict.n_relevant == 2
 
 
 class TestRequireField:
@@ -77,6 +107,25 @@ class TestRequireField:
             [],
         )
         assert verdict.outcome == checkers.VACUOUS
+
+    def test_empty_string_field_counts_as_missing(self):
+        verdict = checkers._check_require_field(
+            {"id": 1, "rule_text": "need evidence", "assert_kind": "require_field", "assert_field": "evidence"},
+            [{"evidence": "", "category": "x"}],
+        )
+        assert verdict.outcome == checkers.FAIL
+
+    def test_non_dict_skipped(self):
+        verdict = checkers._check_require_field(
+            {"id": 1, "rule_text": "need evidence", "assert_kind": "require_field", "assert_field": "evidence"},
+            ["not-a-dict", {"evidence": "x", "category": "y"}],
+        )
+        assert verdict.outcome == checkers.PASS
+        assert verdict.n_relevant == 1
+        assert verdict.n_relevant == 1
+
+
+# --- compliance_rate --------------------------------------------------------
 
 
 class TestComplianceRate:
@@ -104,3 +153,109 @@ class TestComplianceRate:
         assert rate == 0.0
         assert passed == 0
         assert counted == 0
+
+    def test_mixed_outcomes(self):
+        verdicts = [
+            checkers.Verdict(1, "r", "k", checkers.PASS, ""),
+            checkers.Verdict(2, "r", "k", checkers.FAIL, ""),
+            checkers.Verdict(3, "r", "k", checkers.VACUOUS, ""),
+        ]
+        rate, passed, counted = checkers.compliance_rate(verdicts)
+        assert rate == 0.5
+        assert passed == 1
+        assert counted == 2
+
+    def test_all_fail(self):
+        verdicts = [
+            checkers.Verdict(1, "r", "k", checkers.FAIL, ""),
+            checkers.Verdict(2, "r", "k", checkers.FAIL, ""),
+        ]
+        rate, passed, counted = checkers.compliance_rate(verdicts)
+        assert rate == 0.0
+        assert passed == 0
+        assert counted == 2
+
+
+# --- judge LLM path ---------------------------------------------------------
+
+
+class TestCheckWithJudge:
+    def test_judge_returns_pass(self):
+        rule = {
+            "id": 1, "rule_text": "Always include evidence",
+            "assert_kind": "none", "assert_field": "evidence",
+        }
+        findings = [{"file": "x.py", "line": 1, "category": "security",
+                      "severity": "high", "message": "m", "evidence": "e"}]
+
+        mock_llm = MagicMock()
+        mock_llm.structured.return_value = {"passed": True, "reason": "ok"}
+        mock_usage = MagicMock()
+
+        verdict = checkers._check_with_judge(rule, findings, llm=mock_llm, usage=mock_usage)
+        assert verdict.outcome == checkers.PASS
+        assert verdict.subjective is True
+
+    def test_judge_returns_fail(self):
+        rule = {
+            "id": 1, "rule_text": "Always include evidence",
+            "assert_kind": "none", "assert_field": "evidence",
+        }
+        findings = [{"file": "x.py", "line": 1, "category": "security",
+                      "severity": "high", "message": "m", "evidence": ""}]
+
+        mock_llm = MagicMock()
+        mock_llm.structured.return_value = {"passed": False, "reason": "missing evidence"}
+        mock_usage = MagicMock()
+
+        verdict = checkers._check_with_judge(rule, findings, llm=mock_llm, usage=mock_usage)
+        assert verdict.outcome == checkers.FAIL
+        assert verdict.n_relevant == 1
+        assert verdict.subjective is True
+
+    def test_judge_error_falls_back(self):
+        rule = {
+            "id": 1, "rule_text": "Always include evidence",
+            "assert_kind": "none", "assert_field": "evidence",
+        }
+        findings = [{"file": "x.py", "line": 1, "category": "security",
+                      "severity": "high", "message": "m", "evidence": "e"}]
+
+        mock_llm = MagicMock()
+        mock_llm.structured.side_effect = Exception("api error")
+        mock_usage = MagicMock()
+
+        verdict = checkers._check_with_judge(rule, findings, llm=mock_llm, usage=mock_usage)
+        # Should not raise; falls back to VACUOUS with subjective=True
+        assert verdict.outcome == checkers.VACUOUS
+        assert verdict.subjective is True
+
+    def test_judge_passes_reason_in_detail(self):
+        rule = {
+            "id": 1, "rule_text": "Check for X",
+            "assert_kind": "none", "assert_field": "evidence",
+        }
+        findings = [{"file": "x.py", "line": 1, "category": "security",
+                      "severity": "high", "message": "m", "evidence": "e"}]
+
+        mock_llm = MagicMock()
+        mock_llm.structured.return_value = {"passed": True, "reason": "findings match"}
+        mock_usage = MagicMock()
+
+        verdict = checkers._check_with_judge(rule, findings, llm=mock_llm, usage=mock_usage)
+        assert "findings match" in verdict.detail
+
+
+# --- Verdict dataclass -------------------------------------------------------
+
+
+class TestVerdict:
+    def test_create(self):
+        v = checkers.Verdict(1, "r", "k", checkers.PASS, "")
+        assert v.rule_id == 1
+        assert v.outcome == checkers.PASS
+
+    def test_outcomes_are_strings(self):
+        assert checkers.PASS == "pass"
+        assert checkers.FAIL == "fail"
+        assert checkers.VACUOUS == "vacuous"

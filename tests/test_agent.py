@@ -212,3 +212,155 @@ class TestReview:
         result = agent.review("pay", path="svc/pay.py", llm=llm)
         # build_system should have been called with the rules
         assert result.as_dict()["usage"] is not None
+
+
+# --- TestReviewResult ------------------------------------------------------
+
+
+class TestReviewResult:
+    def test_as_dict_contains_all_fields(self):
+        from app.llm import Usage
+        r = agent.ReviewResult(
+            task_id="pay",
+            findings=[{"file": "x.py", "line": 1, "category": "security",
+                       "severity": "high", "message": "m", "evidence": "e"}],
+            injected_rules=[{"rule_text": "r", "id": 1}],
+            usage=Usage(in_tok=10, out_tok=5),
+            t_retrieval=0.1,
+            t_generation=0.5,
+            t_total=0.6,
+            tool_rounds=3,
+            tool_calls=["get_diff", "read_file"],
+            hit_round_cap=True,
+        )
+        d = r.as_dict()
+        assert d["task_id"] == "pay"
+        assert len(d["findings"]) == 1
+        assert d["tool_rounds"] == 3
+        assert d["tool_calls"] == ["get_diff", "read_file"]
+        assert d["hit_round_cap"] is True
+        assert d["injected_rules"] == [{"rule_text": "r", "id": 1}]
+        assert d["timing"]["generation"] == 0.5
+
+
+# --- TestReviewPhase1 ------------------------------------------------------
+
+
+class TestReviewPhase1:
+    def test_no_tool_calls_goes_straight_to_phase2(self):
+        """If model returns end_turn without tools, phase 2 emits findings."""
+        llm = _mock_llm([])
+        llm.structured_responses = [{"findings": []}]
+        result = agent.review("pay", path="svc/pay.py", llm=llm)
+        assert result.tool_rounds == 0
+        assert result.hit_round_cap is False
+
+    def test_multiple_tool_rounds(self):
+        """Model calls tools across multiple rounds before settling."""
+        diff_text = "diff content"
+        round1 = _resp(
+            [_tool_use_block("get_diff", {"task_id": "pay"})],
+            stop_reason="tool_use",
+        )
+        round2 = _resp(
+            [_tool_use_block("read_file", {"path": "svc/pay.py", "start": 1, "end": 5})],
+            stop_reason="tool_use",
+        )
+        round3 = _resp([_text_block("done")], stop_reason="end_turn")
+
+        llm = _mock_llm([round1, round2, round3])
+        llm.structured_responses = [{"findings": []}]
+
+        def fake_dispatch(name, tool_input):
+            if name == "get_diff":
+                return diff_text, False
+            if name == "read_file":
+                return "  1 | x\n  2 | y", False
+            return "", False
+
+        import unittest.mock
+        with unittest.mock.patch("app.agent.tools.dispatch", side_effect=fake_dispatch):
+            result = agent.review("pay", path="svc/pay.py", llm=llm)
+
+        # 3 LLM calls: get_diff (tool_use), read_file (tool_use), done (end_turn)
+        assert result.tool_rounds == 3
+        assert "get_diff" in result.tool_calls
+        assert "read_file" in result.tool_calls
+
+    def test_hit_round_cap(self):
+        """When tool_use persists past MAX_TOOL_ROUNDS, hit_round_cap=True."""
+        # Create MAX_TOOL_ROUNDS responses, all wanting more tools
+        rounds = [
+            _resp(
+                [_tool_use_block("get_diff", {"task_id": "pay"})],
+                stop_reason="tool_use",
+            )
+            for _ in range(agent.config.MAX_TOOL_ROUNDS)
+        ]
+
+        llm = _mock_llm(rounds)
+        llm.structured_responses = [{"findings": []}]
+
+        def fake_dispatch(name, tool_input):
+            return "diff", False
+
+        import unittest.mock
+        with unittest.mock.patch("app.agent.tools.dispatch", side_effect=fake_dispatch):
+            result = agent.review("pay", path="svc/pay.py", llm=llm,
+                                  max_rounds=agent.config.MAX_TOOL_ROUNDS)
+
+        assert result.hit_round_cap is True
+        assert result.tool_rounds == agent.config.MAX_TOOL_ROUNDS
+
+    def test_tool_error_does_not_crash(self):
+        """A tool error is returned to the model as is_error; review continues."""
+        diff_text = "diff content"
+        phase1 = _resp(
+            [_tool_use_block("get_diff", {"task_id": "pay"})],
+            stop_reason="tool_use",
+        )
+        phase2 = _resp([_text_block("done")], stop_reason="end_turn")
+
+        llm = _mock_llm([phase1, phase2])
+        llm.structured_responses = [{"findings": []}]
+
+        def fake_dispatch(name, tool_input):
+            if name == "get_diff":
+                return "no diff for task 'nonexistent'. Available: []", True
+            return "", False
+
+        import unittest.mock
+        with unittest.mock.patch("app.agent.tools.dispatch", side_effect=fake_dispatch):
+            result = agent.review("pay", path="svc/pay.py", llm=llm)
+
+        # 2 LLM calls: get_diff tool_use, then end_turn
+        assert result.tool_rounds == 2
+        assert result.tool_calls == ["get_diff"]
+
+    def test_memory_rules_in_system_blocks(self):
+        """When rules are provided, system blocks include the memory header."""
+        rules = [{"rule_text": "No style nits", "scope": "global", "confidence": 0.9}]
+        blocks = agent.build_system(rules)
+        assert len(blocks) == 2
+        assert agent.MEMORY_HEADER in blocks[1]["text"]
+        assert "No style nits" in blocks[1]["text"]
+
+
+# --- TestBuildSystemEdgeCases ----------------------------------------------
+
+
+class TestBuildSystemEdgeCases:
+    def test_empty_rules_single_block(self):
+        blocks = agent.build_system([])
+        assert len(blocks) == 1
+        assert blocks[0]["text"] == agent.REVIEWER_SYSTEM
+        assert blocks[0]["cache_control"] == {"type": "ephemeral"}
+
+    def test_memory_block_no_cache_control(self):
+        blocks = agent.build_system([{"rule_text": "r", "scope": "g", "confidence": 0.9}])
+        assert "cache_control" not in blocks[1]
+
+    def test_tentative_rules_marked(self):
+        rules = [{"rule_text": "tentative", "scope": "global", "confidence": 0.3}]
+        out = agent.format_memory_block(rules)
+        assert "(tentative)" in out
