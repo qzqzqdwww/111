@@ -173,16 +173,20 @@ def cmd_feedback(args: argparse.Namespace) -> int:
                 f"{f['message'][:56]} → "
             ).strip().lower()
             if ans.startswith("d"):
-                note = console.input("     why? [dim](optional)[/] ").strip() or None
-                payload.append({"index": i, "action": "delete", "note": note})
+                if args.note:
+                    payload.append({"index": i, "action": "delete", "note": args.note})
+                else:
+                    note = console.input("     why? [dim](optional)[/] ").strip() or None
+                    payload.append({"index": i, "action": "delete", "note": note})
             elif ans.startswith("h"):
-                payload.append(
-                    {
-                        "index": i,
-                        "action": "edit",
-                        "replacement": {**findings[i], "severity": "high"},
-                    }
-                )
+                entry = {
+                    "index": i,
+                    "action": "edit",
+                    "replacement": {**findings[i], "severity": "high"},
+                }
+                if args.note:
+                    entry["note"] = args.note
+                payload.append(entry)
 
     if not payload:
         console.print("[yellow]no changes — nothing to learn.[/]")

@@ -84,6 +84,6 @@ class TestRunLinter:
 
     def test_clean_file(self):
         result = tools.run_linter("svc/pay.py")
-        # pay.py has no md5, print, bare except, or requests without timeout
-        # but it does have requests.post without timeout
+        # pay.py has no md5, print, or bare except, but it DOES have
+        # requests.post without a timeout
         assert "B113" in result

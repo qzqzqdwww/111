@@ -30,7 +30,7 @@ STATIC_DIR = Path(__file__).parent / "static"
 app = FastAPI(title="Feedback-Memory Review Agent", version="1.0")
 
 _conn: sqlite3.Connection | None = None
-_lock = threading.Lock()
+_lock = threading.RLock()
 
 
 _db_initialized = False

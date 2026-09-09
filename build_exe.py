@@ -35,8 +35,7 @@ def main() -> int:
         "-m",
         "PyInstaller",
         "--name=ReviewAgent",
-        "--windowed",        # No console window (for web UI mode)
-        "--console",         # Also build a console version for CLI
+        "--console",
         "--add-data", f"{root / 'fixtures'};fixtures",
         "--add-data", f"{root / 'app' / 'static'};app/static",
         "--hidden-import", "uvicorn.logging",
